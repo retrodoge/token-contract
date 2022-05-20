@@ -1,0 +1,391 @@
+/**
+BitDoge ( A community-revamped token, from SnowgeCoin & 8BitDoge).
+**/
+
+pragma solidity ^0.8.0;
+// SPDX-License-Identifier: MIT
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Pair.sol";
+import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol";
+import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/draft-ERC20Permit.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+import "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import "@openzeppelin/contracts/utils/math/SignedSafeMath.sol";
+
+contract RetroDoge is ERC20Permit, Ownable {
+    using SafeMath for uint256;
+
+    IUniswapV2Router02 public uniswapV2Router;
+    address public uniswapV2Pair;
+    bool private swapping;
+    bool public transfersPaused = true;
+    bool public transfersPermanentlyUnpaused = false;
+    bool public launchMode = true;
+    bool public launchModePermanentlyDisabled = false;
+
+    address public _deadWalletAddress = address(0x000000000000000000000000000000000000dEaD);
+    address public _marketingWalletAddress = address(0x9caa801c99Cce589d3A8E3f1a43Fe842aaed2Ca5);
+    address public _stakingWalletAddress = address(0xF89c6A83F7F0B265FF1d2765B83614D7590a29D1);
+    address public MARKETING_TOKEN = address(0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c); //wbnb
+    uint256 public swapTokensAtAmount = 500000 * (10**18);
+
+    mapping(address => bool) public _isBlacklisted;
+    // fees use basis points
+    uint256 public burnFee = 100;
+    uint256 public stakeFee = 200;
+    uint256 public liquidityFee = 200;
+    uint256 public marketingFee = 200;
+
+    uint256 public burnSellFee = 100;
+    uint256 public stakeSellFee = 300;
+    uint256 public liquiditySellFee = 300;
+    uint256 public marketingSellFee = 400;
+
+    uint256 public totalBuyFees = burnFee.add(stakeFee).add(liquidityFee).add(marketingFee);
+    uint256 public totalSellFees = burnSellFee.add(stakeSellFee).add(liquiditySellFee).add(marketingSellFee);
+    uint256 public launchModeFees = 3000;
+    // Sell fees are only used for collection taxes. Buy fees are the ratios used when the swap threshold is hit.
+
+    string public nah = "the fuck are you doing";
+
+    // store addresses that a automatic market maker pairs. Any transfer *to* these addresses
+    // could be subject to a maximum transfer amount
+    mapping (address => bool) public automatedMarketMakerPairs;
+    mapping (address => bool) public excludedFromPausedTransfersAndFees;
+
+    event UpdateUniswapV2Router(address indexed newAddress, address indexed oldAddress);
+    event IncludeInFees(address indexed account, bool isExcluded);
+    event IncludeMultipleAccountsInFees(address[] accounts, bool isExcluded);
+    event SetAutomatedMarketMakerPair(address indexed pair, bool indexed value);
+    event LiquidityWalletUpdated(address indexed newLiquidityWallet, address indexed oldLiquidityWallet);
+
+    event SwapAndLiquify(
+        uint256 tokensSwapped,
+        uint256 ethReceived,
+        uint256 tokensIntoLiqudity
+    );
+
+    event FailToSend();
+
+    modifier maxTax(uint256 value) {
+        require(value < 2500, nah);
+        _;
+    }
+
+    constructor() ERC20("RetroDoge", "RTDOGE") ERC20Permit("RetroDoge") {
+    	IUniswapV2Router02 _uniswapV2Router = IUniswapV2Router02(0x10ED43C718714eb63d5aA57B78B54704E256024E);
+         // Create a uniswap pair for this new token
+        address _uniswapV2Pair = IUniswapV2Factory(_uniswapV2Router.factory())
+            .createPair(address(this), _uniswapV2Router.WETH());
+
+        uniswapV2Router = _uniswapV2Router;
+        uniswapV2Pair = _uniswapV2Pair;
+
+        _setAutomatedMarketMakerPair(_uniswapV2Pair, true);
+        excludedFromPausedTransfersAndFees[owner()] = true;
+        excludedFromPausedTransfersAndFees[address(this)] = true;
+        excludedFromPausedTransfersAndFees[_deadWalletAddress] = true;
+        excludedFromPausedTransfersAndFees[_stakingWalletAddress] = true;
+        excludedFromPausedTransfersAndFees[_marketingWalletAddress] = true;
+
+        _mint(owner(), 10 * (10**9) * (10**18)); // 10 billion total suppply, same as 8bitdoge previously
+    }
+
+    receive() external payable { }
+
+    function marketingIsWETH() public view returns (bool) {
+        return MARKETING_TOKEN == uniswapV2Router.WETH();
+    }
+
+    function updateUniswapV2Router(address newAddress) external onlyOwner {
+        emit UpdateUniswapV2Router(newAddress, address(uniswapV2Router));
+        uniswapV2Router = IUniswapV2Router02(newAddress);
+        try IUniswapV2Factory(uniswapV2Router.factory()).createPair(address(this), uniswapV2Router.WETH()) returns (address _uniswapV2Pair) {
+          uniswapV2Pair = _uniswapV2Pair;
+        } catch {}
+    }
+
+    function updateUniswapV2Pair(address newAddress) external onlyOwner {
+        uniswapV2Pair = newAddress;
+    }
+
+    function setMarketingWallet(address payable wallet) external onlyOwner {
+        _marketingWalletAddress = wallet;
+    }
+
+    function setStakingWallet(address payable wallet) external onlyOwner {
+        _stakingWalletAddress = wallet;
+    }
+
+    function setBurnFee(uint256 value, bool setForSells) external onlyOwner maxTax(value) {
+        if (setForSells) {
+            burnSellFee = value;
+            updateFees(true);
+        } else {
+            burnFee = value;
+            updateFees(false);
+        }
+    }
+
+    function setStakeFee(uint256 value, bool setForSells) external onlyOwner maxTax(value) {
+        if (setForSells) {
+            stakeSellFee = value;
+            updateFees(true);
+        } else {
+            stakeFee = value;
+            updateFees(false);
+        }
+    }
+
+    function setLiquidityFee(uint256 value, bool setForSells) external onlyOwner maxTax(value) {
+        if (setForSells) {
+            liquiditySellFee = value;
+            updateFees(true);
+        } else {
+            liquidityFee = value;
+            updateFees(false);
+        }
+    }
+
+    function setMarketingFee(uint256 value, bool setForSells) external onlyOwner maxTax(value) {
+        if (setForSells) {
+            marketingSellFee = value;
+            updateFees(true);
+        } else {
+            marketingFee = value;
+            updateFees(false);
+        }
+    }
+
+    function updateFees(bool sells) internal {
+        if (!sells) {
+            totalBuyFees = burnFee.add(stakeFee).add(liquidityFee).add(marketingFee);
+        } else {
+            totalSellFees = burnSellFee.add(stakeSellFee).add(liquiditySellFee).add(marketingSellFee);
+        }
+    }
+
+    function setAutomatedMarketMakerPair(address pair, bool value) external onlyOwner {
+        _setAutomatedMarketMakerPair(pair, value);
+    }
+
+    function blacklistAddress(address account, bool value) public onlyOwner {
+        _isBlacklisted[account] = value;
+    }
+
+    function batchBlacklistAddress(address[] memory accounts, bool value) external onlyOwner {
+        for (uint i = 0; i < accounts.length;) {
+            blacklistAddress(accounts[i], value);
+            unchecked { ++i; }
+        }
+    }
+
+    function _setAutomatedMarketMakerPair(address pair, bool value) private {
+        automatedMarketMakerPairs[pair] = value;
+        emit SetAutomatedMarketMakerPair(pair, value);
+    }
+
+    function flipTransfers(bool permanently) external onlyOwner {
+        require(!transfersPermanentlyUnpaused, "can no longer be changed.");
+        transfersPaused = !transfersPaused;
+        if (permanently) transfersPermanentlyUnpaused = true;
+    }
+
+    function excludeFromPaused(address _address, bool value) external onlyOwner {
+        excludedFromPausedTransfersAndFees[_address] = value;
+    }
+
+    function flipLaunchMode(bool permanently) external onlyOwner {
+        require(!launchModePermanentlyDisabled, "can no longer be changed.");
+        launchMode != launchMode;
+        if (permanently) launchModePermanentlyDisabled = true;
+    }
+
+    function setLaunchModeFees(uint256 value) external onlyOwner maxTax(value) {
+        launchModeFees = value;
+    }
+
+    function _transfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal override {
+        require(from != address(0), "ERC20: transfer from the zero address");
+        require(to != address(0), "ERC20: transfer to the zero address");
+        require(!_isBlacklisted[from] && !_isBlacklisted[to], 'Blacklisted address');
+
+        if(amount == 0) {
+            super._transfer(from, to, 0);
+            return;
+        }
+
+        if (transfersPaused && !(excludedFromPausedTransfersAndFees[from] || excludedFromPausedTransfersAndFees[to])) revert("transfers paused.");
+
+        uint256 contractTokenBalance = balanceOf(address(this));
+        bool canSwap = contractTokenBalance >= swapTokensAtAmount;
+
+        // we don't try and do liquidity injection on buys, but we still take taxes.
+        if (canSwap && !swapping && !automatedMarketMakerPairs[from] && from != owner() && to != owner() && !excludedFromPausedTransfersAndFees[from] && !excludedFromPausedTransfersAndFees[to]) {
+            swapping = true;
+
+            uint256 burnTokens = contractTokenBalance.mul(burnFee).div(totalBuyFees);
+            uint256 stakingTokens = contractTokenBalance.mul(stakeFee).div(totalBuyFees);
+            uint256 marketingTokens = contractTokenBalance.mul(marketingFee).div(totalBuyFees);
+
+            if (burnTokens != 0) super._transfer(address(this), _deadWalletAddress, burnTokens);
+            if (stakingTokens != 0) super._transfer(address(this), _stakingWalletAddress, stakingTokens);
+            if (marketingTokens != 0) swapAndSendToMarketing(marketingTokens);
+
+            //liquidity injection is done last, and gets whatever tokens are remaining.
+            uint256 liquidityTokens = balanceOf(address(this));
+            if (liquidityTokens != 0) swapAndLiquify(liquidityTokens);
+
+            swapping = false;
+        }
+
+        // decide whether we can take fees
+        bool canTakeFee = !swapping;
+        if (excludedFromPausedTransfersAndFees[from] || excludedFromPausedTransfersAndFees[to]) canTakeFee = false;
+
+        // decide which fees to take - default to 0 if not a buy/sell.
+        if (canTakeFee) {
+            uint256 fees;
+            if (launchMode && automatedMarketMakerPairs[to]) {
+                fees = amount.mul(launchModeFees).div(10000);
+            } else if (automatedMarketMakerPairs[from]) { //buy
+                fees = amount.mul(totalBuyFees).div(10000);
+            } else if (automatedMarketMakerPairs[to]) { //sell
+                fees = amount.mul(totalSellFees).div(10000);
+            } else {
+                fees = 0;
+            }
+            amount = amount - fees;
+            if (fees != 0) super._transfer(from, address(this), fees);
+        }
+
+        super._transfer(from, to, amount);
+    }
+
+
+    function swapAndSendToMarketing(uint256 tokens) private  {
+        uint256 initialTOKENBalance = IERC20(MARKETING_TOKEN).balanceOf(address(this));
+        swapTokensForTokens(tokens, MARKETING_TOKEN);
+        uint256 newBalance = IERC20(MARKETING_TOKEN).balanceOf(address(this)) - initialTOKENBalance;
+        IERC20(MARKETING_TOKEN).transfer(_marketingWalletAddress, newBalance);
+    }
+
+
+    function swapAndLiquify(uint256 tokens) private {
+       // split the contract balance into halves
+        uint256 half = tokens.div(2);
+        uint256 otherHalf = tokens.sub(half);
+
+        // capture the contract's current ETH balance.
+        // this is so that we can capture exactly the amount of ETH that the
+        // swap creates, and not make the liquidity event include any ETH that
+        // has been manually sent to the contract
+        uint256 initialBalance = address(this).balance;
+
+        // swap tokens for ETH
+        swapTokensForEth(half); // <- this breaks the ETH -> HATE swap when swap+liquify is triggered
+
+        // how much ETH did we just swap into?
+        uint256 newBalance = address(this).balance.sub(initialBalance);
+
+        // add liquidity to uniswap
+        addLiquidity(otherHalf, newBalance);
+
+        emit SwapAndLiquify(half, newBalance, otherHalf);
+    }
+
+
+    function swapTokensForEth(uint256 tokenAmount) private {
+
+        // generate the uniswap pair path of token -> weth
+        address[] memory path = new address[](2);
+        path[0] = address(this);
+        path[1] = uniswapV2Router.WETH();
+        _approve(address(this), address(uniswapV2Router), tokenAmount);
+
+        // make the swap
+        uniswapV2Router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            tokenAmount,
+            0, // accept any amount of ETH
+            path,
+            address(this),
+            block.timestamp
+        );
+
+    }
+
+    function swapTokensForTokens(uint256 tokenAmount, address tokenAddress) private {
+        //handle situation where we don't actually want to Swap
+        if (tokenAmount == 0) {
+          return;
+        }
+
+        address[] memory path;
+        if (marketingIsWETH() && tokenAddress == MARKETING_TOKEN) {
+
+            // Swap for ETH
+            uint256 oldEthBalance = address(this).balance;
+            swapTokensForEth(tokenAmount);
+            uint256 newEthBalance = address(this).balance.sub(oldEthBalance); 
+
+            // Wrap back to WETH
+            (bool wethsuccess, ) = uniswapV2Router.WETH().call{value: newEthBalance}("");
+            require(wethsuccess, "wrap failed.");
+
+        } else {
+            path = new address[](3);
+            path[0] = address(this);
+            path[1] = uniswapV2Router.WETH();
+            path[2] = tokenAddress;
+
+            _approve(address(this), address(uniswapV2Router), tokenAmount);
+
+            uniswapV2Router.swapExactTokensForTokensSupportingFeeOnTransferTokens(
+                tokenAmount,
+                0,
+                path,
+                address(this),
+                block.timestamp
+            );
+        }
+    }
+
+    function addLiquidity(uint256 tokenAmount, uint256 ethAmount) private {
+        // approve token transfer to cover all possible scenarios
+        _approve(address(this), address(uniswapV2Router), tokenAmount);
+
+        // add the liquidity
+        uniswapV2Router.addLiquidityETH{value: ethAmount}(
+            address(this),
+            tokenAmount,
+            0, // slippage is unavoidable
+            0, // slippage is unavoidable
+            address(this),
+            block.timestamp
+        );
+    }
+
+    // Emergency only - Recover Tokens
+    function recoverToken(address _token, uint256 amount) external virtual onlyOwner {
+        IERC20(_token).transfer(owner(), amount);
+    }
+
+    // Emergency only - Recover BNB
+    function recoverBNB(address payable to, uint256 amount) external onlyOwner {
+        to.transfer(amount);
+    }
+
+    function setMarketingToken(address newToken) external onlyOwner {
+        MARKETING_TOKEN = newToken;
+    }
+
+    function setSwapAtBalance(uint256 newSwapAtAmount) external onlyOwner {
+        swapTokensAtAmount = newSwapAtAmount;
+    }
+}
